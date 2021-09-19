@@ -1,263 +1,201 @@
-const API = require('./api');
-let client;
+const rp = require('request-promise-native');
 
-module.exports = function(homebridge) {
-  // console.log("homebridge API version: " + homebridge.version);
+class API {
+  constructor(log) {
+		this.log = log;
+    this.sessionId = null;
+    this.token = null;
+    this.lastRefresh = null;
 
-  const {platformAccessory: PlatformAccessory, hap: {Service, Characteristic, Accessory, uuid: UUIDGen}} = homebridge;
-
-  class SalusIT500 {
-    constructor(log, config, api) {
-			client = new API(log);
-      log("SalusIT500 Init");
-      const platform = this;
-      this.log = log;
-      this.accessories = [];
-
-      this.config = config = (config || {});
-      config.username = config.username || process.env.SALUS_USERNAME;
-      config.password = config.password || process.env.SALUS_PASSWORD;
-
-      for (const key of ['username','password']) {
-        if (!config[key]) {
-          throw new Error('Missing config key: '+key);
-        }
-      }
-
-      this.api = api;
-
-      this.api.on('didFinishLaunching', () => this.didFinishLaunching());
-
-      this.loginPromise = (async () => {
-        try {
-          this.log("Logging in as " + config.username);
-          await client.login({username: config.username, password: config.password});
-          this.log("Login successful");
-          return true
-        } catch (error) {
-          this.log('Login error: ' + error)
-          return false
-        }
-      })();
+    this._getSessionToken = async () => {
+      const response = await rp({
+        url: 'https://salus-it500.com/public/devices.php',
+        headers: {
+          'Cookie': 'PHPSESSID='+this.sessionId,
+        },
+      });
+      const [,token] = response.match(/id="token"[^>]*value="([^"]*)"/m)
+      return token;
     }
 
-    async didFinishLaunching() {
-      this.log('Did finish launching')
-      if (!await this.loginPromise) return;
+    this.login = async ({username, password}) => {
+      this._credentials = {username, password};
 
-      this.api.unregisterPlatformAccessories("homebridge-salus-it500", "SalusIT500", this.accessories);
-      this.accessories = []
-
-      // discover devices
-      const devices = await client.getDevices()
-      this.log('Found ' + devices.length + ' devices');
-
-      for (const device of devices) {
-        const uuid = UUIDGen.generate(device.serial);
-
-        const registeredAccessory = this.accessories.find(a => a.UUID === uuid);
-        if (registeredAccessory) {
-          registeredAccessory.updateReachability(true);
-        } else {
-          const newAccessory = new PlatformAccessory(device.name, uuid, Accessory.Categories.THERMOSTAT);
-
-          newAccessory.context.deviceId = device.id;
-          newAccessory.context.serial = device.serial;
-          newAccessory.context.name = device.name;
-
-          await this.configureAccessory(newAccessory);
-          this.api.registerPlatformAccessories("homebridge-salus-it500", "SalusIT500", [newAccessory]);
-        }
-      }
-    }
-
-    // Function invoked when homebridge tries to restore cached accessory.
-    // Developer can configure accessory at here (like setup event handler).
-    // Update current value.
-    async configureAccessory(accessory) {
-      this.log(accessory.displayName, "Configure Accessory");
-      if (!await this.loginPromise) return;
-
-      const platform = this;
-
-      accessory.reachable = false;
-      // console.log('Characteristic: ', Object.keys(Characteristic).filter(s=>s.includes('Mod')))
-
-      accessory.on('identify', (paired, callback) => {
-        platform.log(accessory.displayName, "Identify!!!");
-        callback();
+      const response = await rp.post({
+        url: 'https://salus-it500.com/public/login.php?lang=en',
+        followRedirect: false,
+        body: 'IDemail='+encodeURIComponent(username)+'&password='+encodeURIComponent(password)+'&login=Login',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        resolveWithFullResponse: true,
+        simple: false,
       });
 
-      const batteryService = accessory.getService(Service.BatteryService) ||
-                             accessory.addService(Service.BatteryService);
+      if (response.statusCode !== 302 || !response.headers.location.startsWith('devices.php')) {
+        throw new Error('Invalid credentials')
+      }
 
-      batteryService
-        .setCharacteristic(Characteristic.ChargingState, Characteristic.ChargingState.NOT_CHARGEABLE)
+      const match = response.headers['set-cookie'][0].match(/PHPSESSID=([^;]+);/);
+      if (!match || !match[1]) throw new Error('Unexpected response');
 
-      batteryService
-        .getCharacteristic(Characteristic.StatusLowBattery)
-        .on('get', getCharacteristicFromDeviceStatus);
+      const [,sessionId] = match;
+      this.sessionId = sessionId;
 
-      const infoService = accessory.getService(Service.AccessoryInformation) ||
-                          accessory.addService(Service.AccessoryInformation);
-      infoService
-        .setCharacteristic(Characteristic.Manufacturer, "Salus")
-        .setCharacteristic(Characteristic.Model, "IT500")
-        .setCharacteristic(Characteristic.Name, accessory.context.name)
-        .setCharacteristic(Characteristic.SerialNumber, accessory.context.serial)
-        .setCharacteristic(Characteristic.FirmwareRevision, 'N/A')
+      const token = await this._getSessionToken({sessionId});
+      this.token = token;
 
-      const thermostatService = accessory.getService(Service.Thermostat) ||
-                                accessory.addService(Service.Thermostat);
+      return true;
+    }
 
-      thermostatService
-        .getCharacteristic(Characteristic.TemperatureDisplayUnits)
-        .setProps({
-          perms: [Characteristic.Perms.READ, Characteristic.Perms.NOTIFY],
-        })
-        .on('get', getCharacteristicFromDeviceValue)
+    // Keep track of pending requests to avoid multiple simultanous network calls
+    this._pendingSessionCheck = null;
+    this._checkSession = async () => {
+      if (this._pendingSessionCheck) return this._pendingSessionCheck;
 
-      thermostatService
-        .getCharacteristic(Characteristic.CurrentTemperature)
-        .on('get', getCharacteristicFromDeviceValue);
-
-      thermostatService
-        .getCharacteristic(Characteristic.TargetTemperature)
-        .setProps({
-          minValue: 5,
-          maxValue: 35,
-        })
-        .on('get', getCharacteristicFromDeviceValue)
-        .on('set', (value, callback) => {
-          platform.log(accessory.displayName, `Set TargetTemperature`, value);
-
-          client.setDeviceValues({
-            deviceId: accessory.context.deviceId,
-            targetTemperature: value,
-          })
-            .then(updateDeviceValues)
-            .then(
-              () => callback(),
-              err => {console.error(err); callback(err)}
-            )
+      const promise = (async () => {
+        const response = await rp({
+          url: 'https://salus-it500.com/public/devices.php',
+          headers: {
+            'Cookie': 'PHPSESSID='+this.sessionId,
+          },
+          followRedirect: false,
+          resolveWithFullResponse: true,
+          simple: false,
         });
 
-      thermostatService
-        .getCharacteristic(Characteristic.TargetHeatingCoolingState)
-        .setProps({
-          validValues: [
-            Characteristic.TargetHeatingCoolingState.AUTO,
-            Characteristic.TargetHeatingCoolingState.OFF,
-          ],
-        })
-        .on('get', getCharacteristicFromDeviceValue)
-        .on('set', (value, callback) => {
-          platform.log(accessory.displayName, `Set TargetHeatingCoolingState`, value);
+        // session expired
+        if (response.statusCode === 302 && response.headers.location.includes('login.php')) {
+          await this.login(this._credentials)
+        }
+      })()
 
-          client.setDeviceValues({
-            deviceId: accessory.context.deviceId,
-            autoMode: value === Characteristic.TargetHeatingCoolingState.AUTO
-          })
-            .then(updateDeviceValues)
-            .then(
-              () => callback(),
-              err => {console.error(err); callback(err)}
-            )
+      this._pendingSessionCheck = promise;
+      try {await promise}
+      finally {this._pendingSessionCheck = null}
+    }
+
+    this.getDevices = async () => {
+      await this._checkSession();
+
+      const response = await rp({
+        url: 'https://salus-it500.com/public/devices.php',
+        headers: {
+          'Cookie': 'PHPSESSID='+this.sessionId,
+        },
+      });
+			
+      const RE = /control\.php\?devId=([^"]+)">(SRT\d+) ([^<]+)</mg;
+      let match;
+      const devices = [];
+      // while (match = RE.exec(response)) {
+      //   const [,id, serial, name] = match;
+      //   devices.push({id, serial, name});
+      // }
+			
+			devices.push({ id: '67143775', serial: 'SRT00101059', name: 'RT310i' })
+
+      return devices;
+    }
+
+    this.getDeviceOnlineStatus = async ({deviceId}) => {
+      await this._checkSession();
+
+      const response = await rp.get({
+        url: 'https://salus-it500.com/public/ajax_device_online_status.php?devId='+deviceId+'&token='+this.token,
+        headers: {
+          'Cookie': 'PHPSESSID='+this.sessionId,
+        },
+      });
+      const flags = response.replace(/"/g, '').split(' ')
+
+      return {
+        online: flags.includes('online'),
+        batteryLow: flags.includes('lowBat'),
+      }
+    }
+
+    // Keep a list of pending requests to avoid multiple simultanous network calls
+    this._loadingDeviceValues = {};
+    this.cachedDeviceValues = {};
+
+    this.getDeviceValues = async ({deviceId}) => {
+      if (this._loadingDeviceValues[deviceId]) {
+        return this._loadingDeviceValues[deviceId];
+      }
+
+      const promise = (async () => {
+        await this._checkSession();
+
+        const json = await rp({
+          url: 'https://salus-it500.com/public/ajax_device_values.php?devId='+deviceId+'&token='+this.token,
+          headers: {
+            'Cookie': 'PHPSESSID='+this.sessionId,
+          },
+          json: true,
         });
 
-      thermostatService
-        .getCharacteristic(Characteristic.CurrentHeatingCoolingState)
-        .on('get', getCharacteristicFromDeviceValue);
+        if (json.tempUnit != 0) {
+          console.warn('Unexpected temp unit: ' + JSON.stringify(json.tempUnit));
+        }
 
-      function updateDeviceValues(values) {
-        const {
-          isHeating,
-          autoMode,
-          currentRoomTemperature,
-          temperatureUnit,
-          currentTargetTemperature,
-        } = values;
+        const values = {
+          currentRoomTemperature: parseFloat(json.CH1currentRoomTemp),
+          currentTargetTemperature: parseFloat(json.CH1currentSetPoint),
+          autoMode: json.CH1autoOff == 0,
+          energySaving: json.esStatus == 1,
+          isHeating: json.CH1heatOnOffStatus == 1,
+          temperatureUnit: json.tempUnit == 0 ? 'C' : 'F',
+        };
+        // console.log(values);
 
-        thermostatService
-          .getCharacteristic(Characteristic.CurrentHeatingCoolingState)
-          .updateValue(
-            isHeating
-              ? Characteristic.CurrentHeatingCoolingState.HEAT
-              : Characteristic.CurrentHeatingCoolingState.OFF
-          );
+        return values;
+      })()
 
-        thermostatService
-          .getCharacteristic(Characteristic.TargetHeatingCoolingState)
-          .updateValue(
-            autoMode
-              ? Characteristic.TargetHeatingCoolingState.AUTO
-              : Characteristic.TargetHeatingCoolingState.OFF
-          );
+      this._loadingDeviceValues[deviceId] = promise;
 
-        thermostatService
-          .getCharacteristic(Characteristic.CurrentTemperature)
-          .updateValue(currentRoomTemperature);
-
-        thermostatService
-          .getCharacteristic(Characteristic.TemperatureDisplayUnits)
-          .updateValue(
-            temperatureUnit === 'C'
-              ? Characteristic.TemperatureDisplayUnits.CELSIUS
-              : Characteristic.TemperatureDisplayUnits.FAHRENHEIT
-          );
-
-        thermostatService
-          .getCharacteristic(Characteristic.TargetTemperature)
-          .updateValue(currentTargetTemperature);
+      try {
+        return (this.cachedDeviceValues[deviceId] = await promise);
+      } finally {
+        this._loadingDeviceValues[deviceId] = null;
       }
+    }
 
-      async function loadDeviceValues() {
-        updateDeviceValues(
-          await client.getDeviceValues({deviceId: accessory.context.deviceId})
-        );
-      }
+    this.setDeviceValues = async ({deviceId, autoMode, energySaving, targetTemperature}) => {
+      await this._checkSession();
 
-      function getCharacteristicFromDeviceValue(callback) {
-        loadDeviceValues()
-          .then(
-            () => callback(null, this.value),
-            err => {console.error(err); callback(err)}
-          );
-      }
+      const body = `
+        token=${encodeURIComponent(this.token)}
+        devId=${encodeURIComponent(deviceId)}
+        tempUnit=0
+        ${targetTemperature != null ? `
+          auto=0
+          auto_setZ1=1
+          current_tempZ1_set=1
+          current_tempZ1=${encodeURIComponent(targetTemperature)}
+        ` : (
+          autoMode ? `
+            auto=0
+            auto_setZ1=1
+          ` : `
+            auto=1
+            auto_setZ1=1
+          `
+        )}
+      `.split('\n').map(s=>s.trim()).filter(Boolean).join('&')
+      // console.log(body);
+      const response = await rp.post({
+        url: 'https://salus-it500.com/includes/set.php',
+        body,
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Cookie': 'PHPSESSID='+this.sessionId,
+        },
+      });
 
-      function updateDeviceStatus(status) {
-        const {
-          batteryLow,
-        } = status;
-
-        batteryService
-          .getCharacteristic(Characteristic.StatusLowBattery)
-          .updateValue(
-            batteryLow
-              ? Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW
-              : Characteristic.StatusLowBattery.BATTERY_LEVEL_NORMAL
-          );
-      }
-
-      async function loadDeviceStatus() {
-        updateDeviceStatus(
-          await client.getDeviceOnlineStatus({deviceId: accessory.context.deviceId})
-        );
-      }
-
-      function getCharacteristicFromDeviceStatus(callback) {
-        loadDeviceStatus()
-          .then(
-            () => callback(null, this.value),
-            err => {console.error(err); callback(err)}
-          );
-      }
-
-      this.accessories.push(accessory);
+      return this.getDeviceValues({deviceId})
     }
   }
-
-  // For platform plugin to be considered as dynamic platform plugin,
-  // registerPlatform(pluginName, platformName, constructor, dynamic), dynamic must be true
-  homebridge.registerPlatform("homebridge-salus-it500", "SalusIT500", SalusIT500, true);
 }
+
+module.exports = API;
