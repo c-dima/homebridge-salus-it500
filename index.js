@@ -1,5 +1,5 @@
 const API = require('./api');
-const client = new API;
+let client;
 
 module.exports = function(homebridge) {
   // console.log("homebridge API version: " + homebridge.version);
@@ -8,6 +8,7 @@ module.exports = function(homebridge) {
 
   class SalusIT500 {
     constructor(log, config, api) {
+			client = new API(log);
       log("SalusIT500 Init");
       const platform = this;
       this.log = log;
